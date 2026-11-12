@@ -113,7 +113,7 @@ Please note that mcp-server-git is currently in early development. The functiona
    - Inputs:
      - `repo_path` (string): Path to the Git repository.
    - Returns: One line per remote and direction, `<name>\t<url> (fetch)` or `(push)` (a partial clone's fetch line ends with its filter, such as ` [blob:none]`), or `No remotes configured`
-   - A credential embedded in a URL is never returned: the whole userinfo of a URL such as `https://user:token@host/...` or `https://token@host/...` is shown as `<redacted>`. An SSH username (`ssh://git@host/...`) is kept, since it names an account rather than authenticating one; a password after it is redacted. A remote-helper address (`https::https://user:token@host/...`) has its inner URL redacted the same way. scp-style addresses (`git@host:path`) and local paths are shown as configured. A line that cannot be parsed is shown as `<redacted>`, and if a configured remote URL (or `insteadOf` rewrite) contains a newline, which git itself refuses, the tool returns an error instead of a listing.
+   - A credential embedded in a URL is never returned: the whole userinfo of a URL such as `https://user:token@host/...` or `https://token@host/...` is shown as `<redacted>`, and so is every query value (`?private_token=<redacted>`, keeping the parameter names) and a non-empty fragment (`#<redacted>`). An SSH username (`ssh://git@host/...`) is kept, since it names an account rather than authenticating one; a password after it is redacted. A remote-helper address (`https::https://user:token@host/...`) has its inner URL redacted the same way. A URL where a `?` or `#` comes before the userinfo's `@` (`https://host?t=a@b`) cannot be split safely, so it is shown as `https://<redacted>`. A token carried as a path segment (`https://host/token/SECRET/r.git`) is not redacted, since it cannot be told apart from a repository name. scp-style addresses (`git@host:path`) and local paths are shown as configured, and a `file://` URL keeps its `?` and `#` parts, which belong to a local file name. A line that cannot be parsed is shown as `<redacted>`, and if a configured remote URL (or `insteadOf` rewrite) contains a newline, which git itself refuses, the tool returns an error instead of a listing.
 
 ### Protocol versions
 
@@ -383,6 +383,31 @@ Add to your Zed settings.json:
 }
 ```
 </details>
+
+## Streamable HTTP
+
+The server talks over stdio by default. With `--transport streamable-http` it
+runs on its own as an HTTP service instead, serving one MCP endpoint, `/mcp`,
+to any number of clients of either protocol era:
+
+```sh
+uvx mcp-server-git --transport streamable-http --repository path/to/git/repo
+```
+
+It listens on `127.0.0.1:3001` unless `HOST` and `PORT` say otherwise (for
+example `PORT=8080`); `HOST=0.0.0.0` exposes it to every machine that can reach
+this one, so set it deliberately. Point a client at the URL, such as
+`http://127.0.0.1:3001/mcp`, instead of giving it a command:
+
+```json
+{
+  "mcpServers": {
+    "git": { "type": "http", "url": "http://127.0.0.1:3001/mcp" }
+  }
+}
+```
+
+Every other option works as it does over stdio; `--repository` matters more here, since any client that can reach the port can use the server. A browser page from any origin but localhost is refused with `403`, whatever `HOST` is, to guard against DNS rebinding; on loopback the SDK also checks each request's `Host` header.
 
 ## Debugging
 

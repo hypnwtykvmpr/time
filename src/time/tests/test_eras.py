@@ -191,3 +191,15 @@ async def test_ping_is_served_only_in_the_legacy_era() -> None:
         with pytest.raises(MCPError) as excinfo:
             await client.session.send_ping()
     assert excinfo.value.error.code == METHOD_NOT_FOUND
+
+
+@pytest.mark.parametrize(("mode", "negotiated"), ERAS)
+@pytest.mark.parametrize("tool", ["get_current_time", "get_time_ago"])
+async def test_utc_flag_in_each_era(mode: str, negotiated: str, tool: str) -> None:
+    async with connect(mode, "America/Chicago") as client:
+        result = await client.call_tool(tool, {"utc": True})
+    assert result.is_error is False
+    data = json.loads(text_of(result))
+    assert data["timezone"] == "UTC"
+    assert data["datetime"].endswith("+00:00")
+    assert result.structured_content == data

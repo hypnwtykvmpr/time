@@ -6,8 +6,10 @@
 // tests can run it in-process; main() serves it on stdio through the SDK's
 // serveStdio entry, which answers 2026-07-28 clients (server/discover, change
 // notifications on subscriptions/listen) and 2025-era clients (initialize,
-// resources/subscribe) from the same factory (#4852). main() runs only when
-// this file is the process entry point, so importing it starts nothing.
+// resources/subscribe) from the same factory (#4852). run() reads --transport
+// and starts stdio (the default) or Streamable HTTP (http.ts, #576). It runs
+// only when this file is the process entry point, so importing it starts
+// nothing.
 import {
   serveStdio,
   type StdioServerHandle,
@@ -15,7 +17,7 @@ import {
 import { McpServer } from "@modelcontextprotocol/server";
 import type { Transport } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { promises as fs, realpathSync } from "fs";
+import { promises as fs, readFileSync, realpathSync, unlinkSync } from "fs";
 import type { FileHandle } from "fs/promises";
 import path from "path";
 import os from "os";
@@ -171,6 +173,60 @@ export function skippedEntitiesNotice(skipped: string[]): string {
   );
 }
 
+// Opt-in ceilings on how large the write tools may grow the graph (#5525).
+// Every mutation reads the whole graph file and writes it back under the
+// cross-process lock, so its cost, and how long it holds the lock, grow
+// linearly with the file. These let an operator bound that growth. Each is
+// unset by default, which leaves the store unbounded, as it always was.
+export interface GraphLimits {
+  // Most entities the graph may hold.
+  maxEntities?: number;
+  // Most relations the graph may hold.
+  maxRelations?: number;
+  // Most bytes the saved graph file may hold.
+  maxFileBytes?: number;
+}
+
+// The environment variable that sets each limit.
+export const GRAPH_LIMIT_ENV: Readonly<Record<keyof GraphLimits, string>> = {
+  maxEntities: "MEMORY_MAX_ENTITIES",
+  maxRelations: "MEMORY_MAX_RELATIONS",
+  maxFileBytes: "MEMORY_MAX_FILE_BYTES",
+};
+
+// Read the limits from the environment. Only an unset variable leaves its
+// limit off; any other value that is not a positive whole number, an empty
+// one included, stops startup, since a limit silently ignored would leave the
+// store unbounded while the operator believes it capped.
+export function graphLimitsFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): GraphLimits {
+  const limits: GraphLimits = {};
+  for (const key of Object.keys(GRAPH_LIMIT_ENV) as (keyof GraphLimits)[]) {
+    const name = GRAPH_LIMIT_ENV[key];
+    if (env[name] === undefined) {
+      continue;
+    }
+    const raw = env[name].trim();
+    const value = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1) {
+      throw new Error(
+        `${name} must be a positive whole number, got "${env[name]}". ` +
+          "Unset it to leave that limit off.",
+      );
+    }
+    limits[key] = value;
+  }
+  return limits;
+}
+
+// How large a graph is, on each dimension GraphLimits caps.
+interface GraphSize {
+  entities: number;
+  relations: number;
+  bytes: number;
+}
+
 // Timings for the cross-process lock around each mutation. Exposed so tests
 // can shorten them; the server always uses the defaults.
 export interface FileLockOptions {
@@ -276,6 +332,72 @@ async function breakStaleLock(
   }
 }
 
+// The lock files this process holds right now, each mapped to the token it
+// writes into it and whether that write has finished. withFileLock releases its lock in a `finally`, which never
+// runs when a signal ends the process, so the exit hook releaseHeldLocks()
+// removes them instead (#5485). Without it, a lock left by a stopped server
+// stalls the next writer until it goes stale, which takes the full staleMs
+// when that writer is on another host (another container) and cannot see
+// that this process has gone.
+interface HeldLock {
+  token: string;
+  written: boolean;
+}
+const heldLocks = new Map<string, HeldLock>();
+
+// The lock paths this process holds right now, for tests.
+export function heldLockPaths(): string[] {
+  return [...heldLocks.keys()];
+}
+
+// Synchronously remove every lock this process still holds, as the process
+// exits: an `exit` listener cannot wait on a promise. As in withFileLock's own
+// release, a lock is removed only while it still holds this process's token,
+// so a lock broken as stale and re-taken by another process stays in place.
+// A lock is tracked from the moment its exclusive create returns, before its
+// token is written. Until that write finishes, a file holding only the start
+// of the token (or none of it) is ours too: the exit interrupted the write.
+// Nothing else can have replaced it by then, since a lock that new, with a
+// live owner, is never judged stale. Once the token is written only an exact
+// match is ours, so another writer's replacement, empty while its own token
+// is being written, is left alone.
+export function releaseHeldLocks(): void {
+  for (const [lockPath, { token, written }] of heldLocks) {
+    try {
+      const contents = readFileSync(lockPath, "utf-8");
+      if (written ? contents === token : token.startsWith(contents)) {
+        unlinkSync(lockPath);
+      }
+    } catch {
+      // Already gone, or unreadable: there is nothing of ours to remove.
+    }
+  }
+  heldLocks.clear();
+}
+
+// The exit codes a shell reports for a process its signal ended: 128 + the
+// signal's number.
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
+
+let lockCleanupInstalled = false;
+
+// Release held locks however the server process ends (#5485): on a normal
+// exit or process.exit() through the `exit` event, and on SIGINT or SIGTERM,
+// whose default action would end the process without emitting `exit`. A
+// signal handler replaces that default, so it exits itself, with the status
+// the default would have given. Installed once, by main(): only the server
+// process should take over its signals, not a test that imports this module.
+export function installLockCleanup(): void {
+  if (lockCleanupInstalled) {
+    return;
+  }
+  lockCleanupInstalled = true;
+  process.on("exit", releaseHeldLocks);
+  for (const [signal, code] of Object.entries(SIGNAL_EXIT_CODES)) {
+    process.on(signal, () => process.exit(code));
+  }
+}
+
 // Run operation while holding an exclusive lock file at lockPath, so that
 // mutations from separate server processes sharing one graph file take turns
 // and each one loads the graph the previous one saved (#4797). The lock is a
@@ -305,14 +427,21 @@ export async function withFileLock<T>(
       }
     }
     if (handle) {
+      // Track the lock before anything else is awaited: a signal is handled
+      // only between tasks, never between the open's completion and this
+      // line, so from here on the exit hook can remove it (#5485).
+      const held: HeldLock = { token, written: false };
+      heldLocks.set(lockPath, held);
       try {
         await handle.writeFile(token);
+        held.written = true;
         await handle.close();
       } catch (error) {
         // The lock was created but not written: remove it rather than leave
         // every other writer waiting for it to go stale.
         await handle.close().catch(ignoreError);
         await fs.unlink(lockPath).catch(ignoreError);
+        heldLocks.delete(lockPath);
         throw error;
       }
       break;
@@ -381,6 +510,13 @@ export async function withFileLock<T>(
     if (current === token) {
       await fs.unlink(lockPath).catch(ignoreError);
     }
+    // Stop tracking the lock only once the release is done, so an exit during
+    // it still removes the lock. A lock this same process broke as stale and
+    // re-took in another withFileLock call carries that call's token, and
+    // stays tracked for it.
+    if (heldLocks.get(lockPath)?.token === token) {
+      heldLocks.delete(lockPath);
+    }
   }
 }
 
@@ -389,6 +525,7 @@ export class KnowledgeGraphManager {
   constructor(
     private memoryFilePath: string,
     private lockOptions: FileLockOptions = {},
+    private limits: GraphLimits = {},
   ) {}
 
   // Serializes all read-modify-write graph mutations behind a single queue.
@@ -439,9 +576,12 @@ export class KnowledgeGraphManager {
   // them back to saveGraph so they are written out unchanged. Otherwise the
   // next unrelated write would silently delete them from disk, together with
   // every valid observation of an entity that has one bad field.
+  // size is the graph as loaded, for the write tools' limit check (see
+  // checkLimits).
   private async loadGraphWithUnreadable(): Promise<{
     graph: KnowledgeGraph;
     unreadable: string[];
+    size: GraphSize;
   }> {
     try {
       const data = await fs.readFile(this.memoryFilePath, "utf-8");
@@ -499,14 +639,23 @@ export class KnowledgeGraphManager {
         }
       }
 
-      return { graph, unreadable };
+      const size = {
+        entities: graph.entities.length,
+        relations: graph.relations.length,
+        bytes: Buffer.byteLength(data, "utf-8"),
+      };
+      return { graph, unreadable, size };
     } catch (error) {
       if (
         error instanceof Error &&
         "code" in error &&
         error.code === "ENOENT"
       ) {
-        return { graph: { entities: [], relations: [] }, unreadable: [] };
+        return {
+          graph: { entities: [], relations: [] },
+          unreadable: [],
+          size: { entities: 0, relations: 0, bytes: 0 },
+        };
       }
       throw error;
     }
@@ -529,9 +678,50 @@ export class KnowledgeGraphManager {
     }
   }
 
+  // Refuse a write that would leave the graph over a limit and larger than it
+  // was (`before`), on any one dimension. Comparing against `before` keeps a
+  // graph already over a lowered limit usable: a call that adds nothing still
+  // succeeds, and the delete tools, which never pass `before`, can always
+  // shrink it. The refusal is thrown before anything is written, so the call
+  // changes nothing.
+  private checkLimits(
+    graph: KnowledgeGraph,
+    content: string,
+    before: GraphSize,
+  ): void {
+    const after: GraphSize = {
+      entities: graph.entities.length,
+      relations: graph.relations.length,
+      bytes: Buffer.byteLength(content, "utf-8"),
+    };
+    const dimensions: [keyof GraphSize, keyof GraphLimits, string][] = [
+      ["entities", "maxEntities", "entities"],
+      ["relations", "maxRelations", "relations"],
+      ["bytes", "maxFileBytes", "bytes in the memory file"],
+    ];
+    for (const [dimension, key, unit] of dimensions) {
+      const limit = this.limits[key];
+      if (
+        limit !== undefined &&
+        after[dimension] > limit &&
+        after[dimension] > before[dimension]
+      ) {
+        throw new Error(
+          `Refused: this change would bring the knowledge graph to ${after[dimension]} ${unit}, ` +
+            `over the limit of ${limit} set by ${GRAPH_LIMIT_ENV[key]}. Nothing was saved. ` +
+            "Delete entities, relations or observations that are no longer needed to make room, " +
+            `or ask the operator to raise ${GRAPH_LIMIT_ENV[key]}.`,
+        );
+      }
+    }
+  }
+
+  // before is the graph's size as loaded; the write tools that add to the
+  // graph pass it, so the save is refused if it breaks a limit (checkLimits).
   private async saveGraph(
     graph: KnowledgeGraph,
     unreadable: string[],
+    before?: GraphSize,
   ): Promise<void> {
     // The modelled fields come first and always hold the current values; a
     // record's extras (see extraFields) follow unchanged. A record created by
@@ -557,6 +747,10 @@ export class KnowledgeGraphManager {
       ),
       ...unreadable,
     ];
+    const content = lines.join("\n") + "\n";
+    if (before) {
+      this.checkLimits(graph, content, before);
+    }
 
     // Write to a temporary file in the same directory, then rename it over
     // the target. fs.writeFile would truncate the memory file before writing,
@@ -601,7 +795,7 @@ export class KnowledgeGraphManager {
       // umask removed.
       await fs.writeFile(
         tempFilePath,
-        lines.join("\n") + "\n",
+        content,
         mode === undefined ? undefined : { mode },
       );
       if (mode !== undefined) {
@@ -617,7 +811,7 @@ export class KnowledgeGraphManager {
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
     return this.withLock(async () => {
-      const { graph, unreadable } = await this.loadGraphWithUnreadable();
+      const { graph, unreadable, size } = await this.loadGraphWithUnreadable();
       const newEntities = entities.filter(
         (e, index) =>
           !graph.entities.some(
@@ -627,14 +821,20 @@ export class KnowledgeGraphManager {
           !entities.slice(0, index).some((earlier) => earlier.name === e.name),
       );
       graph.entities.push(...newEntities);
-      await this.saveGraph(graph, unreadable);
+      // Only a call that adds something is held to the limits: re-saving can
+      // grow an existing file that was not written in this exact form.
+      await this.saveGraph(
+        graph,
+        unreadable,
+        newEntities.length > 0 ? size : undefined,
+      );
       return newEntities;
     });
   }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
     return this.withLock(async () => {
-      const { graph, unreadable } = await this.loadGraphWithUnreadable();
+      const { graph, unreadable, size } = await this.loadGraphWithUnreadable();
       const entityNames = new Set(graph.entities.map((e) => e.name));
 
       relations.forEach((r) => {
@@ -659,7 +859,12 @@ export class KnowledgeGraphManager {
             .some((earlier) => isSameRelation(earlier, r)),
       );
       graph.relations.push(...newRelations);
-      await this.saveGraph(graph, unreadable);
+      // Held to the limits only when it adds something (see createEntities).
+      await this.saveGraph(
+        graph,
+        unreadable,
+        newRelations.length > 0 ? size : undefined,
+      );
       return newRelations;
     });
   }
@@ -668,7 +873,7 @@ export class KnowledgeGraphManager {
     observations: { entityName: string; contents: string[] }[],
   ): Promise<{ entityName: string; addedObservations: string[] }[]> {
     return this.withLock(async () => {
-      const { graph, unreadable } = await this.loadGraphWithUnreadable();
+      const { graph, unreadable, size } = await this.loadGraphWithUnreadable();
       const results = observations.map((o) => {
         const entity = graph.entities.find((e) => e.name === o.entityName);
         if (!entity) {
@@ -682,7 +887,9 @@ export class KnowledgeGraphManager {
         entity.observations.push(...newObservations);
         return { entityName: o.entityName, addedObservations: newObservations };
       });
-      await this.saveGraph(graph, unreadable);
+      // Held to the limits only when it adds something (see createEntities).
+      const added = results.some((r) => r.addedObservations.length > 0);
+      await this.saveGraph(graph, unreadable, added ? size : undefined);
       return results;
     });
   }
@@ -900,7 +1107,7 @@ const RelationSchema = z.object({
   relationType: z.string().describe("The type of the relation"),
 });
 
-const RESOURCE_URI = "memory://knowledge-graph";
+export const RESOURCE_URI = "memory://knowledge-graph";
 
 export const SEARCH_QUERY_MAX_LENGTH = 2048;
 
@@ -957,12 +1164,23 @@ const ReadEntitySchema = EntitySchema.extend({
 // result on stdio; tests connect it to an in-memory transport, so each call
 // returns an independent server with its own subscriber set. `era` is the
 // protocol era the instance will serve, which decides how graph changes are
-// announced (see notifyGraphUpdated).
+// announced (see notifyGraphUpdated). `publishGraphUpdated`, when given,
+// announces every change instead of the instance itself, whatever era wrote
+// it: over HTTP each request gets a fresh server that holds no listen stream
+// and no subscriber, so http.ts hands in the handler's subscription bus, which
+// every open 2026-07-28 stream listens on. `limits` caps how large the write
+// tools may grow the graph; main() and run() read it from the environment.
 export function createServer(
   memoryFilePath: string,
   era: "legacy" | "modern" = "legacy",
+  publishGraphUpdated?: () => void,
+  limits: GraphLimits = {},
 ): McpServer {
-  const knowledgeGraphManager = new KnowledgeGraphManager(memoryFilePath);
+  const knowledgeGraphManager = new KnowledgeGraphManager(
+    memoryFilePath,
+    {},
+    limits,
+  );
 
   const server = new McpServer({
     name: "memory-server",
@@ -980,7 +1198,9 @@ export function createServer(
   // the notification only to a listen stream that named the URI, so it is
   // always handed over.
   function notifyGraphUpdated() {
-    if (era === "modern" || resourceSubscribers.has(RESOURCE_URI)) {
+    if (publishGraphUpdated) {
+      publishGraphUpdated();
+    } else if (era === "modern" || resourceSubscribers.has(RESOURCE_URI)) {
       // Fire-and-forget: the tool result must not wait on (or fail because of)
       // the notification, so a delivery failure is logged rather than thrown.
       server.server
@@ -1431,20 +1651,25 @@ export function registerKnowledgeGraphSubscriptions(
 // including one that stops the transport from starting, is reported on stderr.
 export async function main(transport?: Transport): Promise<StdioServerHandle> {
   const memoryFilePath = await ensureMemoryFilePath();
+  const limits = graphLimitsFromEnv();
   const locationWarning = memoryFileLocationWarning(memoryFilePath);
   if (locationWarning) {
     console.error(locationWarning);
   }
-  const handle = serveStdio(({ era }) => createServer(memoryFilePath, era), {
-    transport,
-    // serveStdio reports a transport that fails, including one that cannot
-    // start, here rather than by rejecting, so record the failure in the
-    // exit status for whatever supervises the process.
-    onerror: (error) => {
-      console.error("Transport error:", error);
-      process.exitCode = 1;
+  installLockCleanup();
+  const handle = serveStdio(
+    ({ era }) => createServer(memoryFilePath, era, undefined, limits),
+    {
+      transport,
+      // serveStdio reports a transport that fails, including one that cannot
+      // start, here rather than by rejecting, so record the failure in the
+      // exit status for whatever supervises the process.
+      onerror: (error) => {
+        console.error("Transport error:", error);
+        process.exitCode = 1;
+      },
     },
-  });
+  );
   console.error("Knowledge Graph MCP Server running on stdio");
   return handle;
 }
@@ -1466,9 +1691,77 @@ export function isMainModule(
   }
 }
 
+/** The transports `--transport` can name. */
+export const TRANSPORTS = ["stdio", "streamable-http"] as const;
+export type TransportName = (typeof TRANSPORTS)[number];
+
+/**
+ * The transport the command line asks for: `--transport <name>` or
+ * `--transport=<name>`, else stdio. Throws on a missing or unknown name.
+ * Other arguments are ignored, as they always have been.
+ */
+export function parseTransport(args: string[]): TransportName {
+  let value: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--transport") {
+      value = args[++index];
+      if (value === undefined) {
+        throw new Error("--transport needs a value: stdio or streamable-http");
+      }
+    } else if (arg.startsWith("--transport=")) {
+      value = arg.slice("--transport=".length);
+    }
+  }
+  if (value === undefined) return "stdio";
+  if (!(TRANSPORTS as readonly string[]).includes(value)) {
+    throw new Error(
+      `Unknown transport ${JSON.stringify(value)}: expected stdio or streamable-http`,
+    );
+  }
+  return value as TransportName;
+}
+
+// Start the server on the transport args names, and hand back how to stop
+// it. Streamable HTTP listens on HOST:PORT (loopback:3001 by default) and also
+// stops, exiting the process, on SIGINT or SIGTERM.
+export async function run(
+  args: string[] = process.argv.slice(2),
+): Promise<{ close: () => Promise<void> }> {
+  if (parseTransport(args) === "stdio") {
+    return main();
+  }
+  const memoryFilePath = await ensureMemoryFilePath();
+  const limits = graphLimitsFromEnv();
+  const locationWarning = memoryFileLocationWarning(memoryFilePath);
+  if (locationWarning) {
+    console.error(locationWarning);
+  }
+  const { httpEndpoint, startHttpServer } = await import("./http.js");
+  const running = await startHttpServer(memoryFilePath, httpEndpoint(), limits);
+  console.error(
+    `Knowledge Graph MCP Server running on Streamable HTTP at ${running.url}`,
+  );
+  const stop = () => {
+    running.close().then(
+      () => process.exit(0),
+      (error: unknown) => {
+        console.error("Error shutting down:", error);
+        process.exit(1);
+      },
+    );
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  return running;
+}
+
 if (isMainModule()) {
-  main().catch((error) => {
-    console.error("Fatal error in main():", error);
+  run().catch((error: unknown) => {
+    console.error(
+      "Fatal error running server:",
+      error instanceof Error ? error.message : error,
+    );
     process.exit(1);
   });
 }

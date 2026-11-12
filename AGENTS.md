@@ -17,6 +17,15 @@ Every rule in this file is true of the repository as it stands. A rule whose
 machinery does not exist yet is added by the change that builds that machinery,
 not in advance.
 
+## This individual Time fork
+
+The maintained server is `src/time`. Before pushing this fork, run
+`node scripts/validate-py.mjs time` and `node scripts/coverage-py.mjs time`;
+these are upstream's checks scoped to this package. The monorepo-wide
+`npm run local:gate` procedure below describes upstream maintenance and is
+not this fork's pre-push command. `.github/workflows/time-ci.yml` runs the
+Time checks on Windows, macOS and Linux.
+
 ## Skills index
 
 | Skill                                                            | Covers                                                                                                                                                                                                                  | How it loads                           |
@@ -61,9 +70,11 @@ servers/
 ├── docs/                     Design documents; quality-gate.md is the gate's reference (stages, CI vs local, the lease);
 │                             contribution-model.md holds the outside-PR backlog plan; ai-software-factory.md is the
 │                             overview of how the rules, skills, gates and sweeps fit together
-├── .github/workflows/        typescript.yml, python.yml (per-package CI), release.yml (publishes on a GitHub Release),
+├── .github/workflows/        time-ci.yml (this fork's Time-only checks); inherited upstream workflows:
+│                             typescript.yml, python.yml (per-package CI), release.yml (publishes on a GitHub Release),
 │                             version-packages.yml (the changesets PR), prepare-python-release.yml (the CalVer PR),
 │                             everything-mcp-diff.yml (each changed server's interface diff on PRs),
+│                             mcp-interface-diff.yml (a dispatch-only placeholder for that file's new name, #5463),
 │                             main-source.yml (a PR into main must bring nothing that is not on v2/main),
 │                             and the scheduled sweeps that file issues: dependency-refresh.yml, dependabot-alerts.yml, sdk-watch.yml
 ├── .github/ISSUE_TEMPLATE/   Bug and feature issue forms; config.yml routes security and new servers away
@@ -688,8 +699,11 @@ look before retrying.
   2026-07-28 request lives under a handle the server mints. Ask a client for
   input (elicitation, sampling, roots) by returning `inputRequired(...)`,
   which the SDK's legacy shim also serves to 2025-era clients.
-- **Transports**: stdio is the default and every server supports it.
-  `everything` also serves Streamable HTTP and HTTP+SSE. **HTTP+SSE is
+- **Transports**: stdio is the default and every server supports it. Every
+  server also serves Streamable HTTP on `/mcp` at `HOST`:`PORT`
+  (loopback:3001 by default), which `everything` selects with its
+  `streamableHttp` argument and the others with `--transport
+  streamable-http`; `everything` alone also serves HTTP+SSE. **HTTP+SSE is
   deprecated**: keep what exists working, and never make it the default or the
   recommended option in new code or docs.
 - **Tool annotations**: every tool you add or change sets `readOnlyHint`,

@@ -8,10 +8,55 @@ Source: https://github.com/modelcontextprotocol/servers/tree/main/src/time
 
 Requires MCP Python SDK 2.x (`mcp>=2.3,<3`).
 
+## Fork behavior
+
+This fork adds an optional `utc` boolean to `get_current_time` and `get_time_ago`.
+Omit it or pass `false` to keep upstream behavior: detect the host timezone and
+use it by default, or use the explicitly supplied `timezone`. Pass `true` to
+return UTC instead; it takes precedence over `timezone` and `--local-timezone`.
+Only JSON booleans are accepted. `convert_time` keeps its source and target
+timezone arguments.
+
+On a host using `America/Chicago`, a call with `{}` returns that timezone and
+the date-appropriate offset (`-06:00` in winter, `-05:00` in summer). A call
+with `{ "utc": true }` returns `"timezone": "UTC"` and an ISO timestamp ending
+in `+00:00`. For example, `{ "hours_ago": 2, "utc": true }` asks
+`get_time_ago` for two elapsed hours ago in UTC.
+
+### Run this checkout with uv
+
+From the repository root, these commands work in PowerShell and POSIX shells:
+
+```sh
+uv sync --frozen --directory src/time --all-extras --dev
+uv run --frozen --directory src/time mcp-server-time
+```
+
+`uvx mcp-server-time` runs the registry release. Use the checkout command above
+to run this fork. No machine-specific path or virtual environment activation
+is required. Python uses the system timezone database when available and the
+locked `tzdata` package as its fallback, including on Windows.
+
+Validate only this server from the repository root:
+
+```sh
+node scripts/validate-py.mjs time
+node scripts/coverage-py.mjs time
+```
+
+These are upstream's locked sync, lint, format, type-check, test, build and
+per-file coverage checks, restricted to Time. They need Node.js 24 or newer
+and uv; no npm install is needed. The dedicated
+[Time workflow](../../.github/workflows/time-ci.yml) runs these checks on
+Windows, macOS and Linux with Python 3.10 and 3.15. In this individual fork,
+validation uses these Time-only commands instead of the upstream monorepo
+`local:gate`, which also tests the other six servers.
+
 ### Available Tools
 
 - `get_current_time` - Get current time in a specific timezone or system timezone.
   - Optional arguments:
+    - `utc` (boolean, default `false`): Return UTC instead of the default or explicit timezone.
     - `timezone` (string): IANA timezone name (e.g., 'America/New_York', 'Europe/London'). Defaults to the server's local timezone.
 
 - `convert_time` - Convert time between timezones.
@@ -24,6 +69,7 @@ Requires MCP Python SDK 2.x (`mcp>=2.3,<3`).
 - `get_time_ago` - Get the time a given number of days, hours, minutes and seconds ago in a specific timezone, for questions such as "what happened in the last 5 hours?".
   - Optional arguments:
     - `timezone` (string): IANA timezone name; defaults to the server's local timezone
+    - `utc` (boolean, default `false`): Return UTC instead of the default or explicit timezone.
     - `days_ago`, `hours_ago`, `minutes_ago`, `seconds_ago` (non-negative JSON integers, default 0; a fraction, numeric string or boolean is rejected): how far back to go. They add up, so two and a half hours ago is `hours_ago: 2, minutes_ago: 30`.
   - The offset is elapsed time, counted back from the current instant, so across a daylight-saving change "a day ago" is exactly 24 hours ago and its wall-clock reading can differ from now by an hour. An offset reaching before year 1 is an error.
 
@@ -231,6 +277,31 @@ Example:
 ```
 
 The Docker image cannot see the host's timezone, so it reads the `LOCAL_TIMEZONE` environment variable when the container starts, and uses `UTC` when it is unset or empty. Pass it with `-e`: `"-e", "LOCAL_TIMEZONE"` forwards the client's own value, as in the Docker configuration above, and `"-e", "LOCAL_TIMEZONE=America/New_York"` sets one. A `--local-timezone` given after the image name takes precedence.
+
+## Streamable HTTP
+
+The server talks over stdio by default. With `--transport streamable-http` it
+runs on its own as an HTTP service instead, serving one MCP endpoint, `/mcp`,
+to any number of clients of either protocol era:
+
+```sh
+uvx mcp-server-time --transport streamable-http
+```
+
+It listens on `127.0.0.1:3001` unless `HOST` and `PORT` say otherwise (for
+example `PORT=8080`); `HOST=0.0.0.0` exposes it to every machine that can reach
+this one, so set it deliberately. Point a client at the URL, such as
+`http://127.0.0.1:3001/mcp`, instead of giving it a command:
+
+```json
+{
+  "mcpServers": {
+    "time": { "type": "http", "url": "http://127.0.0.1:3001/mcp" }
+  }
+}
+```
+
+Every other option works as it does over stdio. A browser page from any origin but localhost is refused with `403`, whatever `HOST` is, to guard against DNS rebinding; on loopback the SDK also checks each request's `Host` header.
 
 ## Example Interactions
 
