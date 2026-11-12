@@ -24,8 +24,9 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/modelcontextprotocol/servers/tree/main/src/time"
-Issues = "https://github.com/modelcontextprotocol/servers/issues"
+Repository = "https://github.com/hypnwtykvmpr/time"
+Upstream = "https://github.com/modelcontextprotocol/servers/tree/main/src/time"
+Issues = "https://github.com/hypnwtykvmpr/time/issues"
 
 [project.scripts]
 mcp-server-time = "mcp_server_time:main"

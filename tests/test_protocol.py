@@ -209,7 +209,13 @@ def expected_tools(local_tz: str) -> list[dict[str, Any]]:
                             f"server's local timezone, '{local_tz}', when omitted."
                         ),
                         "default": local_tz,
-                    }
+                    },
+                    "utc": {
+                        "type": "boolean",
+                        "title": "Utc",
+                        "default": False,
+                        "description": "Return UTC instead of the local or explicitly supplied timezone.",
+                    },
                 },
             },
             "outputSchema": TIME_RESULT_SCHEMA,
@@ -314,6 +320,12 @@ def expected_tools(local_tz: str) -> list[dict[str, Any]]:
                             "'Europe/London'). Optional: defaults to the server's "
                             f"local timezone, '{local_tz}', when omitted."
                         ),
+                    },
+                    "utc": {
+                        "type": "boolean",
+                        "title": "Utc",
+                        "default": False,
+                        "description": "Return UTC instead of the local or explicitly supplied timezone.",
                     },
                     **{
                         f"{unit}_ago": {
@@ -685,10 +697,6 @@ async def test_get_current_time_argument_validation(
         (
             {"timezone": "../etc/passwd"},
             "Invalid timezone: ZoneInfo keys must refer to subdirectories of TZPATH, got: ../etc/passwd",
-        ),
-        (
-            {"timezone": "/etc/localtime"},
-            "Invalid timezone: ZoneInfo keys may not be absolute paths, got: /etc/localtime",
         ),
     ],
 )
@@ -1452,3 +1460,69 @@ async def test_server_discover_answers_the_2026_07_28_era() -> None:
             },
         },
     }
+
+
+@pytest.mark.parametrize("tool", ["get_current_time", "get_time_ago"])
+@pytest.mark.parametrize("arguments", [{}, {"utc": False}])
+@pytest.mark.parametrize(
+    ("instant", "expected"),
+    [
+        ("2026-01-15T12:00:00+00:00", "2026-01-15T06:00:00-06:00"),
+        ("2026-07-15T12:00:00+00:00", "2026-07-15T07:00:00-05:00"),
+    ],
+)
+async def test_utc_flag_defaults_to_detected_central_time(
+    tool: str, arguments: dict[str, Any], instant: str, expected: str
+) -> None:
+    with (
+        frozen_at(instant),
+        patch(
+            "mcp_server_time.server.get_localzone_name", return_value="America/Chicago"
+        ),
+    ):
+        async with connected(None) as session:
+            data = await call_json(session, tool, arguments)
+    assert data["timezone"] == "America/Chicago"
+    assert data["datetime"] == expected
+
+
+@pytest.mark.parametrize("tool", ["get_current_time", "get_time_ago"])
+@pytest.mark.parametrize("timezone", [None, "Asia/Tokyo", ""])
+async def test_utc_flag_overrides_timezone(tool: str, timezone: str | None) -> None:
+    arguments: dict[str, Any] = {"utc": True}
+    if timezone is not None:
+        arguments["timezone"] = timezone
+    if tool == "get_time_ago":
+        arguments["hours_ago"] = 2
+    with frozen_at("2026-01-15T12:00:00+00:00"):
+        async with connected("America/Chicago") as session:
+            result = await call(session, tool, arguments)
+    expected_time = "10:00:00" if tool == "get_time_ago" else "12:00:00"
+    expected = {
+        "timezone": "UTC",
+        "datetime": f"2026-01-15T{expected_time}+00:00",
+        "day_of_week": "Thursday",
+        "is_dst": False,
+    }
+    assert result["isError"] is False
+    assert result["structuredContent"] == expected
+    assert json.loads(result["content"][0]["text"]) == expected
+
+
+@pytest.mark.parametrize("tool", ["get_current_time", "get_time_ago"])
+@pytest.mark.parametrize("utc", ["true", 1, None])
+async def test_utc_flag_requires_a_json_boolean(tool: str, utc: Any) -> None:
+    async with connected("America/Chicago") as session:
+        result = await call(session, tool, {"utc": utc})
+    assert_validation_error(result, tool, "utc", "valid boolean")
+
+
+async def test_absolute_timezone_path_is_a_tool_error() -> None:
+    # Python versions differ in ZoneInfo's wording for a POSIX-looking
+    # absolute path on Windows; the tool error and invalid value are stable.
+    async with connected() as session:
+        result = await call(session, "get_current_time", {"timezone": "/etc/localtime"})
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert text.startswith("Error executing tool get_current_time: Invalid timezone: ")
+    assert "/etc/localtime" in text

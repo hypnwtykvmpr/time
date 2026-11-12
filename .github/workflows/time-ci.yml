@@ -1,0 +1,50 @@
+# Validate only the Time fork with upstream locked checks on each supported OS.
+name: Time
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: time-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Time (${{ matrix.os }}, Python ${{ matrix.python }})
+    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - name: Locked project environment
+        run: uv sync --locked --all-extras --dev
+      - name: Lint
+        run: uv run --locked ruff check .
+      - name: Format
+        run: uv run --locked ruff format --check .
+      - name: Types
+        run: uv run --locked pyright
+      - name: Tests and coverage
+        run: uv run --locked pytest --cov --cov-report=json:coverage.json
+      - name: Per-file coverage
+        run: uv run --locked python ci/coverage_floor.py coverage.json
+      - name: Build
+        run: uv build
+      - name: Preserve the lockfile
+        run: git diff --exit-code -- uv.lock
